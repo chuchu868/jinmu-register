@@ -2,27 +2,29 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+# 修复：设置 Node.js 24 环境变量以避免弃用警告
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
-    # 关键修复：使用 22.04 以确保 libncurses5 可用
     runs-on: ubuntu-22.04
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+    
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.9'
-
+    
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        # 关键修复：移除了 ubuntu 24.04 中不存在的 libncurses5
         sudo apt-get install -y \
           python3-pip \
           build-essential \
@@ -30,17 +32,84 @@ jobs:
           zip \
           unzip \
           wget \
+          curl \
           openjdk-17-jdk \
           libffi-dev \
           libssl-dev \
           zlib1g-dev
-
+    
     - name: Install Python packages
       run: |
         python -m pip install --upgrade pip
-        # 只安装构建工具，kivy会在构建过程中由buildozer管理
         pip install buildozer cython
-
+    
+    - name: Setup Android SDK
+      run: |
+        # 设置 Android SDK 主目录
+        export ANDROID_SDK_ROOT="$HOME/.android/sdk"
+        echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+        
+        # 创建目录
+        mkdir -p $ANDROID_SDK_ROOT
+        mkdir -p $ANDROID_SDK_ROOT/licenses
+        
+        # 接受 Android SDK 许可证
+        echo "d56f5187479451eabf01fb78af6dfcb131a6481e" > $ANDROID_SDK_ROOT/licenses/android-sdk-license
+        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" >> $ANDROID_SDK_ROOT/licenses/android-sdk-license
+        
+        echo "Android SDK 目录: $ANDROID_SDK_ROOT"
+    
+    - name: Install Android SDK Command Line Tools
+      run: |
+        ANDROID_SDK_ROOT="$HOME/.android/sdk"
+        
+        # 下载命令行工具
+        cd /tmp
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+        
+        # 解压到正确位置
+        mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+        unzip -q commandlinetools-linux-11076708_latest.zip -d $ANDROID_SDK_ROOT/cmdline-tools
+        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
+        
+        # 设置环境变量
+        echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+        echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+    
+    - name: Install Android SDK Components
+      run: |
+        ANDROID_SDK_ROOT="$HOME/.android/sdk"
+        export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+        
+        # 接受所有许可证
+        yes | sdkmanager --licenses > /dev/null 2>&1 || true
+        
+        # 安装必要组件
+        echo "安装 Android SDK 平台工具和构建工具..."
+        
+        # 安装 platform-tools（包含 adb 等）
+        sdkmanager "platform-tools"
+        
+        # 安装特定版本的 build-tools（包含 AIDL）
+        # 注意：buildozer.spec 中 android.sdk = 33，因此安装 33.0.0 版本
+        sdkmanager "build-tools;33.0.0"
+        
+        # 安装 Android 33 平台
+        sdkmanager "platforms;android-33"
+        
+        # 验证安装
+        echo "已安装组件:"
+        sdkmanager --list_installed | grep -E "platform|build-tools|platform-tools"
+        
+        # 验证 AIDL 工具是否存在
+        if [ -f "$ANDROID_SDK_ROOT/build-tools/33.0.0/aidl" ]; then
+          echo "✅ AIDL 工具已成功安装"
+          ls -la "$ANDROID_SDK_ROOT/build-tools/33.0.0/" | grep aidl
+        else
+          echo "❌ AIDL 工具未找到"
+          ls -la "$ANDROID_SDK_ROOT/build-tools/33.0.0/" || echo "构建工具目录不存在"
+        fi
+    
     - name: Cache Buildozer dependencies
       uses: actions/cache@v4
       with:
@@ -51,43 +120,44 @@ jobs:
         key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
         restore-keys: |
           ${{ runner.os }}-buildozer-
-
+    
     - name: Build APK
       run: |
-        echo "=== 构建环境检查 ==="
+        # 设置环境变量
+        export ANDROID_SDK_ROOT="$HOME/.android/sdk"
+        export ANDROID_NDK_HOME="$HOME/.buildozer/android/platform/android-ndk-r25b"
+        export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+        
+        echo "=== 构建环境信息 ==="
         echo "工作目录: $(pwd)"
-        echo "主脚本文件:"
-        ls -la *.py || echo "无.py文件"
-        echo "spec文件:"
-        cat buildozer.spec || echo "无spec文件"
+        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+        echo "构建工具版本:"
+        ls -la $ANDROID_SDK_ROOT/build-tools/ || echo "构建工具目录不存在"
         echo "==================="
         
         # 清理旧构建
         rm -rf bin/ .buildozer/android/platform/build-* 2>/dev/null || true
         
-        echo "开始构建APK (这需要较长时间，将下载Android SDK/NDK)..."
-        # 使用verbose模式获取详细日志
-        buildozer -v android debug
+        echo "开始构建 APK..."
+        
+        # 使用 verbose 模式构建，便于调试
+        buildozer -v android debug 2>&1 | tee build.log
+        
         BUILD_STATUS=$?
         
-        echo "构建完成，退出代码: $BUILD_STATUS"
-        
         if [ $BUILD_STATUS -eq 0 ]; then
-            echo "✅ APK构建成功！"
-            echo "生成的APK文件:"
-            ls -lh bin/*.apk
+          echo "✅ APK 构建成功！"
+          echo "生成的 APK 文件:"
+          ls -lh bin/*.apk
         else
-            echo "❌ APK构建失败！"
-            # 输出关键错误日志
-            find .buildozer -name "*.log" -type f 2>/dev/null | head -3 | while read log; do
-                echo "=== 错误日志: $log ==="
-                tail -50 "$log"
-            done
+          echo "❌ APK 构建失败，退出代码: $BUILD_STATUS"
+          echo "构建日志的最后 50 行:"
+          tail -50 build.log || echo "无法读取构建日志"
         fi
         
         exit $BUILD_STATUS
-      timeout-minutes: 30  # 根据网络情况，首次构建可能需更久
-
+      timeout-minutes: 30
+    
     - name: Upload APK artifact
       if: success()
       uses: actions/upload-artifact@v4
@@ -95,7 +165,8 @@ jobs:
         name: jinmu-register-apk
         path: bin/*.apk
         retention-days: 7
-
+    
+    # 修复：修正路径名称为 .buildozer（不是 .builddozer）
     - name: Upload build logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
@@ -103,4 +174,5 @@ jobs:
         name: build-failure-logs
         path: |
           .buildozer/
+          build.log
         retention-days: 3
