@@ -8,146 +8,83 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
-    - name: Set up Java 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
     
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
     
-    - name: Install system dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           python3-pip \
-          build-essential \
           git \
           zip \
           unzip \
-          libffi-dev \
-          libssl-dev \
-          zlib1g-dev
+          openjdk-17-jdk
     
     - name: Install Buildozer
       run: |
-        python -m pip install --upgrade pip
-        pip install buildozer cython==0.29.36
+        pip install buildozer
     
-    - name: Pre-build setup
+    - name: Clean buildozer.spec
       run: |
-        echo "=== 预构建检查 ==="
+        # 确保没有行内注释
+        if [ -f "buildozer.spec" ]; then
+          # 删除所有行内注释（#后面的内容），但保留整行注释
+          sed -i 's/[[:space:]]*#.*$//' buildozer.spec
+          # 删除空行
+          sed -i '/^[[:space:]]*$/d' buildozer.spec
+          echo "清理后的 buildozer.spec:"
+          cat buildozer.spec
+        fi
+        
+        # 确保 main.py 存在
+        if [ ! -f "main.py" ]; then
+          echo "错误：需要 main.py 文件"
+          exit 1
+        fi
+    
+    - name: Build APK
+      run: |
+        echo "开始构建 APK..."
         echo "当前目录: $(pwd)"
         echo "文件列表:"
         ls -la
         
-        # 检查主脚本
-        if [ ! -f "main.py" ]; then
-          echo "❌ 错误: 未找到 main.py 文件"
-          echo "请将 '网页式金木自动注册.py' 重命名为 'main.py'"
-          exit 1
-        fi
+        # 清理旧构建
+        rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 创建或验证 buildozer.spec
-        if [ ! -f "buildozer.spec" ]; then
-          echo "创建 buildozer.spec..."
-          buildozer init
-        fi
+        # 构建 APK
+        buildozer -v android debug 2>&1 | tee build.log
         
-        # 显示关键配置
-        echo "=== Buildozer 配置 ==="
-        grep -E "^(title|package|version|requirements|android\.)" buildozer.spec || true
-    
-    - name: Build APK with Gradle fix
-      run: |
-        echo "开始构建 APK..."
-        echo "注意: 首次构建需要下载 Android SDK/NDK/Gradle，可能需要 20-40 分钟"
-        
-        # 清理之前的构建
-        rm -rf bin/ .buildozer/android/platform/build-* 2>/dev/null || true
-        
-        # 设置构建环境变量
-        export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs=-Xmx2g"
-        export JAVA_OPTS="-Xmx2g"
-        
-        # 分步构建，便于调试
-        echo "步骤 1/3: 初始化构建..."
-        timeout 600 buildozer android update 2>&1 | tee build_step1.log
-        
-        echo "步骤 2/3: 编译 Python 部分..."
-        timeout 1200 buildozer android debug 2>&1 | tee build_step2.log
-        
-        # 检查是否进入 Gradle 阶段
-        if grep -q "gradlew" build_step2.log; then
-          echo "✅ 进入 Gradle 构建阶段"
-          
-          # 如果 Gradle 失败，尝试手动运行
-          GRADLE_DIR=$(find .buildozer -name "gradlew" -type f | head -1 | xargs dirname 2>/dev/null || echo "")
-          
-          if [ -n "$GRADLE_DIR" ] && [ -f "$GRADLE_DIR/gradlew" ]; then
-            echo "尝试手动运行 Gradle..."
-            cd "$GRADLE_DIR"
-            chmod +x gradlew
-            ./gradlew clean assembleDebug --stacktrace --info 2>&1 | tee gradle_build.log
-            cd -
-            
-            # 复制 APK 到 bin 目录
-            APK_FILE=$(find .buildozer -name "*-debug.apk" -type f | head -1)
-            if [ -n "$APK_FILE" ]; then
-              mkdir -p bin
-              cp "$APK_FILE" bin/
-              echo "✅ APK 已复制到 bin 目录"
-              ls -la bin/*.apk
-            fi
-          fi
+        if [ $? -eq 0 ]; then
+          echo "✅ 构建成功!"
+          ls -la bin/*.apk 2>/dev/null || find . -name "*.apk" -type f
         else
-          echo "❌ 构建未进入 Gradle 阶段"
-          echo "最后 50 行日志:"
-          tail -50 build_step2.log
+          echo "❌ 构建失败"
+          echo "最后50行错误:"
+          tail -50 build.log
           exit 1
         fi
-        
-        # 检查最终结果
-        if [ -f "bin/*.apk" ] || [ -n "$(find . -name "*.apk" -type f 2>/dev/null)" ]; then
-          echo "✅ APK 构建成功!"
-          echo "找到的 APK 文件:"
-          find . -name "*.apk" -type f 2>/dev/null | xargs ls -lh
-        else
-          echo "❌ APK 构建失败"
-          echo "查看详细错误日志..."
-          find .buildozer -name "*.log" -type f 2>/dev/null | head -5 | while read log; do
-            echo "=== $(basename "$log") ==="
-            tail -30 "$log"
-          done
-          exit 1
-        fi
-      timeout-minutes: 60
     
-    - name: Upload APK artifact
+    - name: Upload APK
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: jinmu-register-apk
-        path: |
-          bin/*.apk
-          .buildozer/**/*.apk
+        name: apk
+        path: bin/*.apk
         retention-days: 7
     
-    - name: Upload build logs
-      if: always()
+    - name: Upload logs
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: build-logs
-        path: |
-          build_*.log
-          gradle_build.log
-          .buildozer/**/*.log
-        retention-days: 3
+        path: build.log
