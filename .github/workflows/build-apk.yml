@@ -27,102 +27,84 @@ jobs:
           git \
           zip \
           unzip \
-          wget \
-          curl \
           openjdk-17-jdk \
           libffi-dev \
           libssl-dev \
           zlib1g-dev
-        
-        # 验证 Java 版本
-        echo "Java版本:"
-        java -version
     
-    - name: Install Buildozer
+    - name: Install Buildozer with specific version
       run: |
         python -m pip install --upgrade pip
-        # 安装最新版 Buildozer
-        pip install buildozer cython
-        
-        echo "Buildozer版本:"
-        buildozer --version
-    
-    - name: Cache Buildozer dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.buildozer
-          ~/.android
-          ~/.gradle
-        key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
-        restore-keys: |
-          ${{ runner.os }}-buildozer-
+        # 安装特定版本的 buildozer 和 cython
+        pip install "buildozer==1.5.0" "cython==0.29.36"
     
     - name: Pre-build setup
       run: |
-        echo "=== 预构建检查 ==="
-        echo "工作目录: $(pwd)"
-        echo "文件列表:"
-        ls -la
-        
-        # 检查主脚本
-        if [ -f "main.py" ]; then
-          echo "✅ 找到主脚本: main.py"
-        else
-          echo "❌ 未找到 main.py"
-          echo "请确保已将 '网页式金木自动注册.py' 重命名为 'main.py'"
+        # 确保 main.py 存在
+        if [ ! -f "main.py" ]; then
+          echo "错误：未找到 main.py，请确保主脚本已正确命名"
           exit 1
         fi
         
-        # 检查 buildozer.spec
-        if [ -f "buildozer.spec" ]; then
-          echo "✅ 找到 buildozer.spec"
-          echo "当前配置:"
-          grep -E "title|entrypoint|requirements|android\." buildozer.spec || true
-        else
-          echo "❌ 未找到 buildozer.spec"
-          exit 1
+        # 如果不存在 buildozer.spec，创建基本配置
+        if [ ! -f "buildozer.spec" ]; then
+          buildozer init
+          echo "已创建 buildozer.spec，请根据需要进行修改"
         fi
     
-    - name: Build APK (使用 Buildozer 自动管理)
+    - name: Build APK with automatic fix
       run: |
-        echo "开始构建 APK..."
-        echo "注意：首次构建需要下载 Android SDK/NDK，可能需要 20-40 分钟"
+        echo "开始构建 APK，将自动修复编译错误..."
         
-        # 清理之前的构建
+        # 清理旧构建
         rm -rf bin/ .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 设置详细日志级别并开始构建
-        timeout 3600 buildozer -v android debug 2>&1 | tee build_output.log
+        # 首次尝试构建
+        timeout 1800 buildozer -v android debug 2>&1 | tee build_output.log || true
         
-        BUILD_STATUS=${PIPESTATUS[0]}
-        
-        if [ $BUILD_STATUS -eq 0 ]; then
-          echo "✅ APK 构建成功!"
-          echo "生成的 APK 文件:"
-          find bin/ -name "*.apk" -type f 2>/dev/null | xargs ls -lh || echo "未找到 APK 文件"
+        # 检查是否有 jnius 错误
+        if grep -q "undeclared name not builtin: long" build_output.log; then
+          echo "检测到 'long' 类型错误，正在应用修复..."
+          
+          # 查找并修复 jnius_utils.pxi
+          JNIUS_FILE=$(find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
+          
+          if [ -n "$JNIUS_FILE" ]; then
+            echo "找到 jnius_utils.pxi: $JNIUS_FILE"
+            # 备份原文件
+            cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"
+            # 修复 long 类型错误
+            sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
+            echo "已修复 long 类型错误"
+            
+            # 重新构建
+            echo "重新构建..."
+            rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
+            timeout 1800 buildozer -v android debug 2>&1 | tee build_output2.log
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ 修复成功！APK 构建完成"
+              ls -la bin/*.apk 2>/dev/null || echo "APK 文件位置可能在其他目录"
+            else
+              echo "❌ 修复后构建仍然失败"
+              tail -50 build_output2.log
+              exit 1
+            fi
+          else
+            echo "未找到 jnius_utils.pxi 文件"
+            exit 1
+          fi
+        elif grep -q "BUILD SUCCESSFUL" build_output.log; then
+          echo "✅ 首次构建成功！"
+          ls -la bin/*.apk 2>/dev/null || echo "APK 文件位置可能在其他目录"
         else
-          echo "❌ APK 构建失败!"
-          echo "=== 错误摘要 ==="
-          
-          # 检查常见错误
-          if grep -q "unknown revision or path not in the working tree" build_output.log; then
-            echo "检测到 git 版本问题，请检查 buildozer.spec 中的 p4a.commit 设置"
-          fi
-          
-          if grep -q "Command failed" build_output.log; then
-            echo "检测到命令执行失败，查看详细日志:"
-            grep -A5 -B5 "Command failed" build_output.log | head -20
-          fi
-          
-          echo "=== 最后 50 行日志 ==="
+          echo "❌ 构建失败，但不是因为 long 类型错误"
           tail -50 build_output.log
+          exit 1
         fi
-        
-        exit $BUILD_STATUS
       timeout-minutes: 60
     
-    - name: Upload APK artifact
+    - name: Upload APK
       if: success()
       uses: actions/upload-artifact@v4
       with:
@@ -130,11 +112,11 @@ jobs:
         path: bin/*.apk
         retention-days: 7
     
-    - name: Upload build logs on failure
+    - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: build-failure-logs
+        name: build-logs
         path: |
           build_output.log
           .buildozer/**/*.log
