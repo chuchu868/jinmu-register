@@ -2,23 +2,17 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Set up Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -34,81 +28,89 @@ jobs:
           git \
           zip \
           unzip \
-          libffi-dev \
-          libssl-dev \
-          zlib1g-dev
+          openjdk-17-jdk
 
     - name: Install Buildozer
       run: |
         python -m pip install --upgrade pip
         pip install buildozer cython
 
-    - name: Pre-download and fix jnius
-      run: |
-        echo "=== 步骤1: 预下载python-for-android ==="
-        # 仅下载不构建
-        buildozer android update 2>&1 | tail -30 || true
-        
-        echo "=== 步骤2: 等待文件下载完成 ==="
-        sleep 10
-        
-        echo "=== 步骤3: 查找并修复 jnius_utils.pxi ==="
-        # 查找文件
-        JNIUS_FILE=$(find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
-        
-        if [ -n "$JNIUS_FILE" ]; then
-          echo "找到文件: $JNIUS_FILE"
-          echo "备份原文件..."
-          cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"
-          
-          echo "应用修复..."
-          # 修复方案1: 替换 isinstance(arg, long)
-          sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
-          # 修复方案2: 替换 <long> 类型
-          sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
-          
-          echo "验证修复结果:"
-          grep -n "long" "$JNIUS_FILE" || echo "✅ 文件中已无 'long' 关键字"
-        else
-          echo "❌ 未找到 jnius_utils.pxi 文件"
-          echo "尝试手动查找..."
-          find ~/.buildozer -name "*.pxi" -type f 2>/dev/null
-        fi
-
-    - name: Build APK
+    - name: Build APK with Real-time Fix
       id: build-step
       run: |
-        echo "=== 开始构建 APK ==="
-        echo "首次构建可能需要 10-20 分钟..."
-        
-        # 清理旧构建
+        echo "=== 开始构建，并准备实时修复 ==="
         rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 执行构建
-        timeout 1800 buildozer -v android debug 2>&1 | tee full_build.log
-        BUILD_STATUS=${PIPESTATUS[0]}
+        # 创建一个封装脚本，用于在构建过程中捕获并修复错误
+        cat > build_with_fix.sh << 'EOF'
+#!/bin/bash
+set -e
+
+LOG_FILE="full_build.log"
+# 启动 buildozer，并将其输出同时写入日志文件和屏幕
+buildozer -v android debug 2>&1 | tee "$LOG_FILE" | while IFS= read -r line; do
+    echo "$line"
+    # 关键：实时检测日志中是否出现 'long' 类型错误
+    if echo "$line" | grep -q "undeclared name not builtin: long"; then
+        echo "⚠️ 检测到 'long' 类型编译错误，正在尝试实时修复..."
         
-        echo "构建退出代码: $BUILD_STATUS"
+        # 立即查找并修复 jnius_utils.pxi
+        # 此时文件肯定已被下载到构建目录中
+        JNIUS_FILE=$(find .buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
         
-        # 搜索APK文件
-        APK_FILES=$(find . -name "*.apk" -type f 2>/dev/null)
-        APK_COUNT=$(echo "$APK_FILES" | wc -w 2>/dev/null || echo 0)
+        if [ -n "$JNIUS_FILE" ] && [ -f "$JNIUS_FILE" ]; then
+            echo "  找到文件: $JNIUS_FILE"
+            echo "  应用修复..."
+            sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
+            sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
+            echo "  ✅ 实时修复完成。构建将继续。"
+        else
+            echo "  ❌ 错误：无法找到文件进行实时修复。"
+        fi
+    fi
+done
+
+# 检查最终构建结果
+BUILD_EXIT_CODE=${PIPESTATUS[0]}
+EOF
+
+        chmod +x build_with_fix.sh
+        # 执行封装脚本，给予足够超时时间
+        timeout 1200 ./build_with_fix.sh
+        
+        BUILD_EXIT_CODE=$?
+        echo "构建最终退出代码: $BUILD_EXIT_CODE"
+        
+        # 无论构建结果如何，都尝试查找 APK
+        echo "=== 搜索 APK 文件 ==="
+        mkdir -p bin
+        if find . -name "*.apk" -type f -exec cp {} bin/ \; 2>/dev/null; then
+            APK_COUNT=$(ls -1 bin/*.apk 2>/dev/null | wc -l)
+        else
+            APK_COUNT=0
+        fi
         
         if [ $APK_COUNT -gt 0 ]; then
-          echo "✅ 找到 $APK_COUNT 个 APK 文件"
-          echo "$APK_FILES"
-          mkdir -p bin
-          # 复制第一个APK到bin目录
-          echo "$APK_FILES" | head -1 | xargs -I {} cp {} bin/
-          echo "APK_FOUND=true" >> $GITHUB_OUTPUT
+            echo "✅ 成功！找到 $APK_COUNT 个 APK 文件。"
+            ls -lh bin/*.apk
+            echo "APK_FOUND=true" >> $GITHUB_OUTPUT
         else
-          echo "❌ 未找到 APK 文件"
-          echo "APK_FOUND=false" >> $GITHUB_OUTPUT
-          echo "=== 错误摘要 ==="
-          tail -50 full_build.log
+            echo "❌ 未找到 APK 文件。"
+            echo "APK_FOUND=false" >> $GITHUB_OUTPUT
+            # 显示关键错误，帮助诊断
+            echo "=== 构建日志关键错误摘要 ==="
+            grep -i -B2 -A2 "error\|failed\|long" full_build.log | tail -30
+        fi
+        
+        # 保存构建状态
+        echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
+        
+        # 关键：如果没生成APK，即使脚本没报错，也标记为失败
+        if [ $APK_COUNT -eq 0 ]; then
+            exit 1
         fi
 
-    - name: Upload APK
+    - name: Upload APK Artifact
       if: steps.build-step.outputs.APK_FOUND == 'true'
       uses: actions/upload-artifact@v4
       with:
@@ -116,10 +118,10 @@ jobs:
         path: bin/*.apk
         retention-days: 7
 
-    - name: Upload logs
+    - name: Upload Logs for Diagnosis
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
+        name: build-logs-full
         path: full_build.log
         retention-days: 5
