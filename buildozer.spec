@@ -28,3 +28,13 @@ android.allow_backup = False
 android.wakelock = True
 
 log_level = 2
+
+android.gradle_properties = 
+    org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+    org.gradle.parallel=true
+    org.gradle.caching=true
+    org.gradle.configureondemand=true
+    org.gradle.daemon=false
+    android.useAndroidX=true
+    android.enableJetifier=false
+    android.enableR8=true
