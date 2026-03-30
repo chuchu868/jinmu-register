@@ -2,23 +2,30 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches: [ main ]
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    
+    timeout-minutes: 40 # 设置超时，避免额度过度消耗
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-    
-    - name: Install dependencies
+
+    - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -27,172 +34,116 @@ jobs:
           git \
           zip \
           unzip \
-          openjdk-17-jdk \
           libffi-dev \
           libssl-dev \
           zlib1g-dev
-    
+
     - name: Install Buildozer
       run: |
+        python -m pip install --upgrade pip
         pip install buildozer cython
-    
-    - name: Fix jnius compilation error before build
-      run: |
-        echo "开始修复 jnius 模块的 'long' 类型错误..."
-        
-        # 等待 python-for-android 下载完成
-        echo "等待 python-for-android 下载..."
-        
-        # 首先运行一次 buildozer 命令以下载 python-for-android
-        timeout 300 buildozer android update 2>&1 | tail -50 || true
-        
-        # 查找并修复 jnius_utils.pxi 文件
-        echo "查找 jnius_utils.pxi 文件..."
-        JNIUS_FILE=$(find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
-        
-        if [ -n "$JNIUS_FILE" ]; then
-          echo "找到文件: $JNIUS_FILE"
-          echo "备份原文件..."
-          cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"
-          
-          echo "修复 'long' 类型引用..."
-          # 修复方案1：将 isinstance(arg, long) 改为 isinstance(arg, int)
-          sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
-          
-          # 修复方案2：将 <long> 类型转换改为 <long long>
-          sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
-          
-          echo "修复完成，检查修复结果:"
-          grep -n "long" "$JNIUS_FILE" || echo "文件中已无 'long' 关键字"
-        else
-          echo "警告：未找到 jnius_utils.pxi，将在构建过程中尝试修复"
-        fi
-        
-        # 创建修复脚本，在构建过程中也会执行
-        cat > fix_jnius.py << 'EOF'
-#!/usr/bin/env python3
-import os
-import re
-import sys
 
-def fix_jnius_file(filepath):
-    """修复 jnius_utils.pxi 文件中的 long 类型问题"""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # 修复 1: isinstance(arg, long) -> isinstance(arg, int)
-        new_content = re.sub(r'isinstance\(([^,]+),\s*long\)', r'isinstance(\1, int)', content)
-        
-        # 修复 2: <long> -> <long long>
-        new_content = new_content.replace('<long>', '<long long>')
-        
-        if new_content != content:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            print(f"已修复文件: {filepath}")
-            return True
-        else:
-            print(f"文件无需修改: {filepath}")
-            return False
-    except Exception as e:
-        print(f"修复文件时出错 {filepath}: {e}")
-        return False
+    # 核心优化：添加缓存，大幅减少后续构建时间
+    - name: Cache Buildozer and Android dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.buildozer
+          ~/.android
+          ~/.gradle/caches
+        key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+        restore-keys: |
+          ${{ runner.os }}-buildozer-
 
-if __name__ == "__main__":
-    # 在常见位置查找 jnius_utils.pxi
-    search_paths = [
-        os.path.expanduser("~/.buildozer/android/platform/python-for-android"),
-        os.path.expanduser("~/.local/share/python-for-android"),
-        "/tmp/python-for-android",
-    ]
-    
-    for base_path in search_paths:
-        if os.path.exists(base_path):
-            for root, dirs, files in os.walk(base_path):
-                if "jnius_utils.pxi" in files:
-                    filepath = os.path.join(root, "jnius_utils.pxi")
-                    if fix_jnius_file(filepath):
-                        sys.exit(0)
-    
-    print("未找到 jnius_utils.pxi 文件")
-    sys.exit(1)
-EOF
-        
-        python3 fix_jnius.py || echo "预修复完成，构建时会再次尝试"
-    
-    - name: Build APK with automatic fix
+    - name: Build APK with Automatic JNius Fix
       run: |
-        echo "开始构建 APK，将自动处理编译错误..."
+        echo "开始构建 APK..."
+        echo "若缓存命中，构建将显著加快。"
         
-        # 清理旧构建
+        # 设置环境变量，确保工具链路径正确
+        export ANDROID_SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+        
+        # 清理旧的构建输出，但保留已缓存的SDK/NDK
         rm -rf .buildozer/android/platform/build-* bin/ 2>/dev/null || true
-        
-        # 创建构建脚本，包含自动修复机制
-        cat > build_with_fix.sh << 'EOF'
+
+        # 使用整合修复的构建脚本
+        cat > build_final.sh << 'EOF'
 #!/bin/bash
 set -e
 
-echo "步骤 1: 初始构建尝试..."
-if timeout 1800 buildozer -v android debug 2>&1 | tee build.log; then
-    echo "✅ 构建成功!"
+LOG_FILE="build.log"
+echo "构建日志保存至: $LOG_FILE"
+
+# 尝试第一次构建
+echo "=== 第一次构建尝试 ==="
+if timeout 1800 buildozer -v android debug 2>&1 | tee "$LOG_FILE"; then
+    echo "✅ 首次构建成功！"
     exit 0
 fi
 
-echo "⚠️  首次构建失败，尝试修复后重新构建..."
-
-# 查找并修复 jnius 文件
-find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | while read file; do
-    echo "修复文件: $file"
-    # 备份
-    cp "$file" "${file}.backup"
-    # 修复 long 类型
-    sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$file"
-    sed -i 's/<long>/<long long>/g' "$file"
-done
-
-echo "步骤 2: 修复后重新构建..."
-rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
-
-if timeout 1800 buildozer -v android debug 2>&1 | tee -a build.log; then
-    echo "✅ 修复后构建成功!"
-    exit 0
+# 如果失败，检查是否是 jnius 的 long 类型错误
+if grep -q "undeclared name not builtin: long" "$LOG_FILE"; then
+    echo "检测到 'jnius' 模块编译错误，正在尝试修复..."
+    
+    # 查找并修复 jnius_utils.pxi 文件
+    find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1 | while read -r JNIUS_FILE; do
+        echo "修复文件: $JNIUS_FILE"
+        cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"
+        # 将 isinstance(arg, long) 替换为 isinstance(arg, int)
+        sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
+        # 将 C 类型 <long> 替换为 <long long>
+        sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
+        echo "修复完成。"
+    done
+    
+    echo "=== 修复后重新构建 ==="
+    rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
+    if timeout 1800 buildozer -v android debug 2>&1 | tee -a "$LOG_FILE"; then
+        echo "✅ 修复后构建成功！"
+        exit 0
+    else
+        echo "❌ 修复后构建仍然失败。"
+    fi
 else
-    echo "❌ 修复后构建仍然失败"
-    echo "最后 50 行错误日志:"
-    tail -50 build.log
-    exit 1
+    echo "❌ 构建失败，但不是因为 'long' 类型错误。"
 fi
+
+# 最终失败处理
+echo "=== 最后50行构建日志 ==="
+tail -50 "$LOG_FILE"
+exit 1
 EOF
-        
-        chmod +x build_with_fix.sh
-        ./build_with_fix.sh
-        
-        # 检查是否生成了 APK
+
+        chmod +x build_final.sh
+        ./build_final.sh
+
+        # 验证APK是否生成
         if find . -name "*.apk" -type f 2>/dev/null | grep -q .; then
-            echo "✅ APK 构建成功!"
+            echo "✅ APK 构建成功！"
             mkdir -p bin
-            find . -name "*.apk" -type f -exec cp {} bin/ \;
-            ls -la bin/*.apk
+            find . -name "*-debug.apk" -type f -exec cp {} bin/ \;
+            echo "生成的APK文件："
+            ls -lh bin/*.apk
         else
-            echo "❌ 未找到 APK 文件"
-            echo "构建日志摘要:"
-            grep -i "error\|failed\|exception" build.log | tail -20
+            echo "❌ 错误：构建过程未生成任何APK文件。"
+            echo "请查看上方日志或详细的 build.log 文件。"
             exit 1
         fi
-    
-    - name: Upload APK
+
+    - name: Upload APK Artifact
       if: success()
       uses: actions/upload-artifact@v4
       with:
         name: jinmu-register-apk
         path: bin/*.apk
-    
-    - name: Upload logs on failure
+        retention-days: 7
+
+    - name: Upload Build Logs on Failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
+        name: build-failure-logs
         path: |
           build.log
           .buildozer/**/*.log
+        retention-days: 3
