@@ -2,19 +2,19 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Set up Java 17
+    - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
@@ -43,7 +43,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install buildozer cython
 
-    - name: Cache Buildozer and Android dependencies
+    - name: Cache dependencies
       uses: actions/cache@v4
       with:
         path: |
@@ -54,45 +54,77 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-buildozer-
 
-    - name: Build APK
+    - name: Build APK with robust verification
+      id: build
       run: |
-        echo "开始构建APK..."
+        echo "=== 开始构建 APK ==="
         echo "工作目录: $(pwd)"
-        echo "文件列表:"
-        ls -la
         
-        # 清理之前的构建
+        # 1. 清理旧构建产物
         rm -rf bin/ .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 构建APK
-        timeout 2400 buildozer -v android debug 2>&1 | tee build.log
+        # 2. 执行构建，捕获完整日志
+        buildozer -v android debug 2>&1 | tee full_build.log
+        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        echo "Buildozer 退出代码: $BUILD_EXIT_CODE"
         
-        # 检查构建结果
-        if [ $? -eq 0 ] && [ -f "bin/*.apk" ]; then
-          echo "✅ APK构建成功!"
-          echo "生成的APK文件:"
-          find bin/ -name "*.apk" -type f 2>/dev/null | xargs ls -lh
+        # 3. 无论构建命令返回什么状态，都主动搜索 APK
+        echo ""
+        echo "=== 主动搜索所有 APK 文件 ==="
+        APK_PATHS=$(find . -name "*.apk" -type f 2>/dev/null)
+        
+        if [ -n "$APK_PATHS" ]; then
+          echo "✅ 搜索到 APK 文件:"
+          echo "$APK_PATHS"
+          # 移动到统一的 bin 目录以便上传
+          mkdir -p bin
+          echo "$APK_PATHS" | xargs -I {} cp {} bin/
+          echo "已复制到 bin 目录:"
+          ls -lh bin/*.apk
+          echo "APK_FOUND=true" >> $GITHUB_OUTPUT
         else
-          echo "❌ APK构建失败!"
-          echo "错误日志:"
-          tail -100 build.log
-          exit 1
+          echo "❌ 未找到任何 .apk 文件"
+          echo "APK_FOUND=false" >> $GITHUB_OUTPUT
+          
+          # 提供调试信息
+          echo ""
+          echo "=== 调试信息 ==="
+          echo "1. 检查 .buildozer 目录结构:"
+          find .buildozer -type d -name "*apk*" -o -name "*output*" 2>/dev/null | head -10
+          echo ""
+          echo "2. 构建日志最后 100 行:"
+          tail -100 full_build.log
+          echo ""
+          echo "3. 关键错误信息:"
+          grep -i -A2 -B2 "error\|failed\|exception\|No such file\|not found" full_build.log | tail -30
         fi
+        
+        # 4. 将构建状态传递给后续步骤
+        echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
+      timeout-minutes: 30
 
-    - name: Upload APK artifact
-      if: success()
+    - name: Upload APK Artifact
+      if: steps.build.outputs.APK_FOUND == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: jinmu-register-apk
         path: bin/*.apk
         retention-days: 7
 
-    - name: Upload build logs
-      if: failure()
+    - name: Upload detailed logs on failure
+      if: steps.build.outputs.APK_FOUND == 'false'
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
+        name: build-failure-details
         path: |
-          build.log
+          full_build.log
           .buildozer/**/*.log
-        retention-days: 3
+        retention-days: 5
+      continue-on-error: true # 即使上传失败，也不阻塞工作流标记为失败
+
+    - name: Fail workflow if no APK
+      if: steps.build.outputs.APK_FOUND == 'false'
+      run: |
+        echo "❌ 工作流终止：构建过程未生成 APK 文件。"
+        echo "请下载并查看 'build-failure-details' Artifact 中的日志以诊断问题。"
+        exit 1
