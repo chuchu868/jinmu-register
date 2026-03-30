@@ -8,7 +8,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    
+    # 修复Node.js警告
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
     - name: Checkout code
@@ -19,72 +22,122 @@ jobs:
       with:
         python-version: '3.9'
     
-    - name: Install dependencies
+    - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           python3-pip \
+          build-essential \
           git \
           zip \
           unzip \
-          openjdk-17-jdk
+          openjdk-17-jdk \
+          libffi-dev \
+          libssl-dev \
+          zlib1g-dev
     
     - name: Install Buildozer
       run: |
-        pip install buildozer
+        python -m pip install --upgrade pip
+        pip install buildozer cython
     
-    - name: Clean buildozer.spec
+    - name: Clean and validate configuration
       run: |
-        # 确保没有行内注释
-        if [ -f "buildozer.spec" ]; then
-          # 删除所有行内注释（#后面的内容），但保留整行注释
-          sed -i 's/[[:space:]]*#.*$//' buildozer.spec
-          # 删除空行
-          sed -i '/^[[:space:]]*$/d' buildozer.spec
-          echo "清理后的 buildozer.spec:"
-          cat buildozer.spec
-        fi
-        
-        # 确保 main.py 存在
-        if [ ! -f "main.py" ]; then
-          echo "错误：需要 main.py 文件"
-          exit 1
-        fi
-    
-    - name: Build APK
-      run: |
-        echo "开始构建 APK..."
+        echo "=== 配置验证 ==="
         echo "当前目录: $(pwd)"
         echo "文件列表:"
         ls -la
         
-        # 清理旧构建
-        rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
-        
-        # 构建 APK
-        buildozer -v android debug 2>&1 | tee build.log
-        
-        if [ $? -eq 0 ]; then
-          echo "✅ 构建成功!"
-          ls -la bin/*.apk 2>/dev/null || find . -name "*.apk" -type f
-        else
-          echo "❌ 构建失败"
-          echo "最后50行错误:"
-          tail -50 build.log
+        # 检查main.py是否存在
+        if [ ! -f "main.py" ]; then
+          echo "❌ 错误: 未找到main.py文件"
+          echo "请确保已重命名主脚本: mv '网页式金木自动注册.py' main.py"
           exit 1
         fi
+        
+        # 清理buildozer.spec中的注释
+        if [ -f "buildozer.spec" ]; then
+          echo "清理buildozer.spec文件..."
+          # 移除所有行内注释
+          sed -i 's/[[:space:]]*#.*$//' buildozer.spec
+          echo "清理后的buildozer.spec:"
+          cat buildozer.spec
+        fi
     
-    - name: Upload APK
-      if: success()
+    - name: Build APK with verification
+      id: build-apk
+      run: |
+        echo "=== 开始构建APK ==="
+        
+        # 设置超时（首次构建需要更长时间）
+        timeout 1800 buildozer -v android debug 2>&1 | tee build_output.log
+        
+        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        echo "构建退出代码: $BUILD_EXIT_CODE"
+        
+        # 检查是否生成了APK文件
+        echo "=== 查找APK文件 ==="
+        APK_FILES=$(find . -name "*.apk" -type f 2>/dev/null)
+        
+        if [ -n "$APK_FILES" ]; then
+          echo "✅ 找到APK文件:"
+          echo "$APK_FILES" | xargs ls -la
+          
+          # 确保APK在bin目录
+          mkdir -p bin
+          for apk in $APK_FILES; do
+            if [[ "$apk" != *"/bin/"* ]]; then
+              echo "移动APK到bin目录: $apk"
+              cp "$apk" bin/
+            fi
+          done
+          
+          echo "✅ 构建成功完成"
+          echo "APK_COUNT=$(find bin/ -name '*.apk' -type f | wc -l)" >> $GITHUB_OUTPUT
+        else
+          echo "❌ 未找到任何APK文件"
+          echo "=== 构建日志最后100行 ==="
+          tail -100 build_output.log
+          echo "=== 可能的错误 ==="
+          grep -i "error\|failed\|exception" build_output.log | tail -20
+          
+          # 检查.buildozer目录
+          echo "=== .buildozer目录内容 ==="
+          find .buildozer -name "*.log" -type f 2>/dev/null | head -5 | while read log; do
+            echo "日志文件: $log"
+            tail -20 "$log"
+          done
+          
+          echo "APK_COUNT=0" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+      timeout-minutes: 30
+    
+    - name: Upload APK artifact
+      if: steps.build-apk.outputs.APK_COUNT != '0'
       uses: actions/upload-artifact@v4
       with:
-        name: apk
+        name: jinmu-register-apk
         path: bin/*.apk
         retention-days: 7
     
-    - name: Upload logs
-      if: failure()
+    - name: Upload build logs
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
-        path: build.log
+        name: build-debug-logs
+        path: |
+          build_output.log
+          .buildozer/**/*.log
+        retention-days: 3
+    
+    - name: Fail if no APK found
+      if: steps.build-apk.outputs.APK_COUNT == '0'
+      run: |
+        echo "❌ 构建过程未生成APK文件"
+        echo "虽然构建命令返回成功，但没有生成APK，这通常是配置问题"
+        echo "请检查以下可能的问题："
+        echo "1. buildozer.spec 配置文件是否正确"
+        echo "2. main.py 文件是否存在且无语法错误"
+        echo "3. 构建日志中是否有隐藏的错误"
+        exit 1
