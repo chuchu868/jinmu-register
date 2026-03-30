@@ -2,14 +2,14 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
-
+    timeout-minutes: 40
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
       with:
         python-version: '3.9'
 
-    - name: Install dependencies
+    - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -28,89 +28,113 @@ jobs:
           git \
           zip \
           unzip \
-          openjdk-17-jdk
+          openjdk-17-jdk \
+          libffi-dev \
+          libssl-dev \
+          zlib1g-dev
 
     - name: Install Buildozer
       run: |
         python -m pip install --upgrade pip
         pip install buildozer cython
 
-    - name: Build APK with Real-time Fix
+    - name: Pre-build setup
+      run: |
+        echo "=== 预构建检查 ==="
+        echo "工作目录: $(pwd)"
+        echo "文件列表:"
+        ls -la
+        
+        if [ ! -f "main.py" ]; then
+          echo "❌ 错误: 未找到 main.py 文件"
+          echo "请将 '网页式金木自动注册.py' 重命名为 'main.py'"
+          exit 1
+        fi
+        
+        if [ ! -f "buildozer.spec" ]; then
+          echo "❌ 错误: 未找到 buildozer.spec 文件"
+          exit 1
+        fi
+        
+        echo "✅ 必要文件检查通过"
+
+    - name: Create fix script
+      run: |
+        echo '#!/bin/bash' > /tmp/fix_jnius.sh
+        echo 'set -e' >> /tmp/fix_jnius.sh
+        echo 'echo "[修复脚本] 查找并修复 jnius_utils.pxi 文件..."' >> /tmp/fix_jnius.sh
+        echo 'JNIUS_FILE=$(find .buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)' >> /tmp/fix_jnius.sh
+        echo 'if [ -f "$JNIUS_FILE" ]; then' >> /tmp/fix_jnius.sh
+        echo '  echo "[修复脚本] 找到文件: $JNIUS_FILE"' >> /tmp/fix_jnius.sh
+        echo '  cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"' >> /tmp/fix_jnius.sh
+        echo '  echo "[修复脚本] 已备份原文件"' >> /tmp/fix_jnius.sh
+        echo '  sed -i "s/isinstance(\\([^,]*\\),\\s*long)/isinstance(\\1, int)/g" "$JNIUS_FILE"' >> /tmp/fix_jnius.sh
+        echo '  sed -i "s/<long>/<long long>/g" "$JNIUS_FILE"' >> /tmp/fix_jnius.sh
+        echo '  echo "[修复脚本] 修复完成"' >> /tmp/fix_jnius.sh
+        echo 'else' >> /tmp/fix_jnius.sh
+        echo '  echo "[修复脚本] 未找到 jnius_utils.pxi 文件"' >> /tmp/fix_jnius.sh
+        echo 'fi' >> /tmp/fix_jnius.sh
+        chmod +x /tmp/fix_jnius.sh
+
+    - name: Build APK
       id: build-step
       run: |
-        echo "=== 开始构建，并准备实时修复 ==="
+        echo "=== 开始构建 APK ==="
+        echo "首次构建可能需要 10-20 分钟..."
+        
+        # 清理旧构建
         rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 创建一个封装脚本，用于在构建过程中捕获并修复错误
-        cat > build_with_fix.sh << 'EOF'
-#!/bin/bash
-set -e
-
-LOG_FILE="full_build.log"
-# 启动 buildozer，并将其输出同时写入日志文件和屏幕
-buildozer -v android debug 2>&1 | tee "$LOG_FILE" | while IFS= read -r line; do
-    echo "$line"
-    # 关键：实时检测日志中是否出现 'long' 类型错误
-    if echo "$line" | grep -q "undeclared name not builtin: long"; then
-        echo "⚠️ 检测到 'long' 类型编译错误，正在尝试实时修复..."
+        # 首次构建（可能会失败）
+        buildozer -v android debug 2>&1 | tee build_output.log
         
-        # 立即查找并修复 jnius_utils.pxi
-        # 此时文件肯定已被下载到构建目录中
-        JNIUS_FILE=$(find .buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
+        # 运行修复脚本
+        /tmp/fix_jnius.sh
         
-        if [ -n "$JNIUS_FILE" ] && [ -f "$JNIUS_FILE" ]; then
-            echo "  找到文件: $JNIUS_FILE"
-            echo "  应用修复..."
-            sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
-            sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
-            echo "  ✅ 实时修复完成。构建将继续。"
-        else
-            echo "  ❌ 错误：无法找到文件进行实时修复。"
-        fi
-    fi
-done
-
-# 检查最终构建结果
-BUILD_EXIT_CODE=${PIPESTATUS[0]}
-EOF
-
-        chmod +x build_with_fix.sh
-        # 执行封装脚本，给予足够超时时间
-        timeout 1200 ./build_with_fix.sh
+        # 再次构建
+        buildozer -v android debug 2>&1 | tee -a build_output.log
         
-        BUILD_EXIT_CODE=$?
-        echo "构建最终退出代码: $BUILD_EXIT_CODE"
-        
-        # 无论构建结果如何，都尝试查找 APK
+        # 搜索 APK 文件
         echo "=== 搜索 APK 文件 ==="
         mkdir -p bin
-        if find . -name "*.apk" -type f -exec cp {} bin/ \; 2>/dev/null; then
-            APK_COUNT=$(ls -1 bin/*.apk 2>/dev/null | wc -l)
+        APK_FILES=$(find . -name "*.apk" -type f 2>/dev/null)
+        APK_COUNT=0
+        
+        if [ -n "$APK_FILES" ]; then
+            APK_COUNT=$(echo "$APK_FILES" | wc -l)
+            echo "找到 $APK_COUNT 个 APK 文件:"
+            echo "$APK_FILES"
+            
+            # 复制到 bin 目录
+            echo "$APK_FILES" | head -1 | xargs -I {} cp {} bin/
+            echo "已复制 APK 到 bin/ 目录:"
+            ls -lh bin/*.apk
         else
-            APK_COUNT=0
+            echo "未找到任何 APK 文件"
         fi
         
+        # 输出构建结果
         if [ $APK_COUNT -gt 0 ]; then
-            echo "✅ 成功！找到 $APK_COUNT 个 APK 文件。"
-            ls -lh bin/*.apk
+            echo "✅ APK 构建成功！"
             echo "APK_FOUND=true" >> $GITHUB_OUTPUT
         else
-            echo "❌ 未找到 APK 文件。"
+            echo "❌ APK 构建失败"
             echo "APK_FOUND=false" >> $GITHUB_OUTPUT
-            # 显示关键错误，帮助诊断
-            echo "=== 构建日志关键错误摘要 ==="
-            grep -i -B2 -A2 "error\|failed\|long" full_build.log | tail -30
+            
+            # 显示关键错误
+            echo "=== 构建日志关键信息 ==="
+            if [ -f "build_output.log" ]; then
+                echo "最后 50 行日志:"
+                tail -50 build_output.log
+            fi
         fi
         
-        # 保存构建状态
-        echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
-        
-        # 关键：如果没生成APK，即使脚本没报错，也标记为失败
+        # 如果没有生成 APK，返回失败
         if [ $APK_COUNT -eq 0 ]; then
             exit 1
         fi
 
-    - name: Upload APK Artifact
+    - name: Upload APK artifact
       if: steps.build-step.outputs.APK_FOUND == 'true'
       uses: actions/upload-artifact@v4
       with:
@@ -118,10 +142,12 @@ EOF
         path: bin/*.apk
         retention-days: 7
 
-    - name: Upload Logs for Diagnosis
+    - name: Upload build logs
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs-full
-        path: full_build.log
+        name: build-debug-logs
+        path: |
+          build_output.log
+          .buildozer/**/*.log
         retention-days: 5
