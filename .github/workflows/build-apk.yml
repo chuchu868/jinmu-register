@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK (With Fix)
 
 on:
   push:
@@ -8,144 +8,87 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Set up Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
 
-    - name: Install system dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           python3-pip \
-          build-essential \
           git \
           zip \
           unzip \
-          libffi-dev \
-          libssl-dev \
-          zlib1g-dev
+          openjdk-17-jdk
 
     - name: Install Buildozer
       run: |
         python -m pip install --upgrade pip
-        # 安装构建所需的核心包
-        pip install buildozer cython
+        pip install buildozer
 
-    - name: Cache Android SDK/NDK and Buildozer
-      uses: actions/cache@v4
-      id: cache-android
-      with:
-        path: |
-          ~/.buildozer
-          ~/.android
-          ~/.gradle/caches
-        key: ${{ runner.os }}-android-deps-${{ hashFiles('buildozer.spec') }}
-        restore-keys: |
-          ${{ runner.os }}-android-deps-
-
-    # ========== 核心修复步骤 ==========
-    - name: Pre-build - Download Python-for-Android and Fix JNius
+    - name: Fix jnius before build
       run: |
-        echo "=== 阶段 1: 触发Python-for-Android下载 ==="
-        # 此命令会触发下载python-for-android，但可能因错误而退出。我们只关心它是否下载了文件。
-        timeout 60 buildozer android update 2>&1 | tail -30 || echo “继续执行修复...”
-
-        echo "=== 阶段 2: 查找并修复 jnius_utils.pxi 文件 ==="
-        # 关键：等待并查找文件
-        MAX_WAIT=30
-        COUNTER=0
-        JNIUS_FILE=""
-
-        while [ $COUNTER -lt $MAX_WAIT ] && [ -z "$JNIUS_FILE" ]; do
-          sleep 2
-          JNIUS_FILE=$(find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
-          COUNTER=$((COUNTER + 1))
-          echo "等待文件... ($COUNTER/$MAX_WAIT)"
-        done
-
+        echo "=== 修复 jnius 模块 ==="
+        
+        # 尝试先下载python-for-android
+        echo "下载python-for-android..."
+        buildozer android update 2>&1 | tail -20 || true
+        
+        # 查找并修复jnius文件
+        echo "查找jnius_utils.pxi文件..."
+        sleep 5
+        
+        JNIUS_FILE=$(find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)
+        
         if [ -n "$JNIUS_FILE" ]; then
-          echo "✅ 找到文件: $JNIUS_FILE"
-          echo "备份原文件..."
-          cp "$JNIUS_FILE" "${JNIUS_FILE}.backup.$(date +%s)"
-          echo "应用修复：将 'long' 替换为 'int'..."
-          # 执行修复
+          echo "找到文件: $JNIUS_FILE"
+          echo "应用修复..."
           sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
-          sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
-          echo "修复完成。验证修改:"
-          grep -n "long" "$JNIUS_FILE" || echo "文件中已无'long'关键字。"
+          echo "修复完成"
         else
-          echo "⚠️  警告：在预期路径未找到 jnius_utils.pxi 文件。"
-          echo "构建过程将尝试继续，但如果失败，请检查 .buildozer 目录结构。"
+          echo "未找到jnius文件，继续构建"
         fi
-    # ========== 核心修复步骤结束 ==========
 
     - name: Build APK
       id: build-step
       run: |
-        echo "=== 开始最终 APK 构建 ==="
-        # 清理旧的构建输出，但保留已下载的SDK/NDK
+        echo "=== 开始构建 ==="
+        
         rm -rf .buildozer/android/platform/build-* bin/ 2>/dev/null || true
         
-        # 执行构建，并捕获详细的日志
-        timeout 1800 buildozer -v android debug 2>&1 | tee full_build.log
-        BUILD_CMD_EXIT_CODE=${PIPESTATUS[0]}
-        echo "Buildozer 命令退出代码: $BUILD_CMD_EXIT_CODE"
-
-        echo "=== 检查构建产物 ==="
-        # 无论命令退出代码如何，都主动搜索 APK
-        mkdir -p bin
-        APK_FOUND=false
+        buildozer -v android debug 2>&1 | tee build_output.log
         
-        # 搜索所有可能的APK输出路径
-        POSSIBLE_APK_PATHS=$(find . -name "*.apk" -type f 2>/dev/null)
-        
-        if [ -n "$POSSIBLE_APK_PATHS" ]; then
-          echo "找到APK文件，复制到 bin/ 目录:"
-          echo "$POSSIBLE_APK_PATHS"
-          echo "$POSSIBLE_APK_PATHS" | xargs -I {} cp {} bin/
-          APK_FOUND=true
-        fi
-
-        # 检查 bin 目录是否真的有文件
-        if ls bin/*.apk 1> /dev/null 2>&1; then
-          echo "✅ 确认APK已存在于 bin/ 目录。"
+        # 检查APK是否生成
+        if find . -name "*.apk" -type f 2>/dev/null | grep -q .; then
+          echo "✅ APK生成成功"
+          mkdir -p bin
+          find . -name "*.apk" -type f -exec cp {} bin/ \;
           echo "APK_FOUND=true" >> $GITHUB_OUTPUT
         else
-          echo "❌ 在 bin/ 目录中未找到APK文件。"
-          echo "=== 构建日志摘要（错误信息）==="
-          grep -i -A5 -B5 "error\|failed\|exception\|long" full_build.log | tail -50
+          echo "❌ 未生成APK"
           echo "APK_FOUND=false" >> $GITHUB_OUTPUT
         fi
-        # 将构建日志作为输出保存
-        echo "BUILD_LOG_FILE=full_build.log" >> $GITHUB_OUTPUT
 
-    - name: Upload APK Artifact
+    - name: Upload APK
       if: steps.build-step.outputs.APK_FOUND == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: jinmu-register-apk
+        name: jinmu-apk
         path: bin/*.apk
         retention-days: 7
 
-    - name: Upload Detailed Build Logs
-      if: always() # 无论成功失败都上传日志
+    - name: Upload logs
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: build-debug-logs
-        path: |
-          ${{ steps.build-step.outputs.BUILD_LOG_FILE }}
-          .buildozer/**/*.log
-        retention-days: 5
+        name: build-logs
+        path: build_output.log
+        retention-days: 3
