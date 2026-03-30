@@ -2,13 +2,13 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch: # 允许手动触发
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40 # 设置超时，避免额度过度消耗
+    timeout-minutes: 40
 
     steps:
     - name: Checkout code
@@ -43,7 +43,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install buildozer cython
 
-    # 核心优化：添加缓存，大幅减少后续构建时间
     - name: Cache Buildozer and Android dependencies
       uses: actions/cache@v4
       with:
@@ -55,82 +54,32 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-buildozer-
 
-    - name: Build APK with Automatic JNius Fix
+    - name: Build APK
       run: |
-        echo "开始构建 APK..."
-        echo "若缓存命中，构建将显著加快。"
+        echo "开始构建APK..."
+        echo "工作目录: $(pwd)"
+        echo "文件列表:"
+        ls -la
         
-        # 设置环境变量，确保工具链路径正确
-        export ANDROID_SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+        # 清理之前的构建
+        rm -rf bin/ .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 清理旧的构建输出，但保留已缓存的SDK/NDK
-        rm -rf .buildozer/android/platform/build-* bin/ 2>/dev/null || true
-
-        # 使用整合修复的构建脚本
-        cat > build_final.sh << 'EOF'
-#!/bin/bash
-set -e
-
-LOG_FILE="build.log"
-echo "构建日志保存至: $LOG_FILE"
-
-# 尝试第一次构建
-echo "=== 第一次构建尝试 ==="
-if timeout 1800 buildozer -v android debug 2>&1 | tee "$LOG_FILE"; then
-    echo "✅ 首次构建成功！"
-    exit 0
-fi
-
-# 如果失败，检查是否是 jnius 的 long 类型错误
-if grep -q "undeclared name not builtin: long" "$LOG_FILE"; then
-    echo "检测到 'jnius' 模块编译错误，正在尝试修复..."
-    
-    # 查找并修复 jnius_utils.pxi 文件
-    find ~/.buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1 | while read -r JNIUS_FILE; do
-        echo "修复文件: $JNIUS_FILE"
-        cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"
-        # 将 isinstance(arg, long) 替换为 isinstance(arg, int)
-        sed -i 's/isinstance(\([^,]*\),\s*long)/isinstance(\1, int)/g' "$JNIUS_FILE"
-        # 将 C 类型 <long> 替换为 <long long>
-        sed -i 's/<long>/<long long>/g' "$JNIUS_FILE"
-        echo "修复完成。"
-    done
-    
-    echo "=== 修复后重新构建 ==="
-    rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
-    if timeout 1800 buildozer -v android debug 2>&1 | tee -a "$LOG_FILE"; then
-        echo "✅ 修复后构建成功！"
-        exit 0
-    else
-        echo "❌ 修复后构建仍然失败。"
-    fi
-else
-    echo "❌ 构建失败，但不是因为 'long' 类型错误。"
-fi
-
-# 最终失败处理
-echo "=== 最后50行构建日志 ==="
-tail -50 "$LOG_FILE"
-exit 1
-EOF
-
-        chmod +x build_final.sh
-        ./build_final.sh
-
-        # 验证APK是否生成
-        if find . -name "*.apk" -type f 2>/dev/null | grep -q .; then
-            echo "✅ APK 构建成功！"
-            mkdir -p bin
-            find . -name "*-debug.apk" -type f -exec cp {} bin/ \;
-            echo "生成的APK文件："
-            ls -lh bin/*.apk
+        # 构建APK
+        timeout 2400 buildozer -v android debug 2>&1 | tee build.log
+        
+        # 检查构建结果
+        if [ $? -eq 0 ] && [ -f "bin/*.apk" ]; then
+          echo "✅ APK构建成功!"
+          echo "生成的APK文件:"
+          find bin/ -name "*.apk" -type f 2>/dev/null | xargs ls -lh
         else
-            echo "❌ 错误：构建过程未生成任何APK文件。"
-            echo "请查看上方日志或详细的 build.log 文件。"
-            exit 1
+          echo "❌ APK构建失败!"
+          echo "错误日志:"
+          tail -100 build.log
+          exit 1
         fi
 
-    - name: Upload APK Artifact
+    - name: Upload APK artifact
       if: success()
       uses: actions/upload-artifact@v4
       with:
@@ -138,11 +87,11 @@ EOF
         path: bin/*.apk
         retention-days: 7
 
-    - name: Upload Build Logs on Failure
+    - name: Upload build logs
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: build-failure-logs
+        name: build-logs
         path: |
           build.log
           .buildozer/**/*.log
