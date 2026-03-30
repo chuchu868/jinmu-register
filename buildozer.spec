@@ -27,6 +27,3 @@ android.logcat_filters = *:D
 
 android.wakelock = True
 android.allow_backup = False
-
-p4a.branch = develop
-android.enable_androidx = True
