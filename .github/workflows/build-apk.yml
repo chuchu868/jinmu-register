@@ -58,41 +58,54 @@ jobs:
         
         echo "✅ 必要文件检查通过"
 
-    - name: Create fix script
-      run: |
-        echo '#!/bin/bash' > /tmp/fix_jnius.sh
-        echo 'set -e' >> /tmp/fix_jnius.sh
-        echo 'echo "[修复脚本] 查找并修复 jnius_utils.pxi 文件..."' >> /tmp/fix_jnius.sh
-        echo 'JNIUS_FILE=$(find .buildozer -name "jnius_utils.pxi" -type f 2>/dev/null | head -1)' >> /tmp/fix_jnius.sh
-        echo 'if [ -f "$JNIUS_FILE" ]; then' >> /tmp/fix_jnius.sh
-        echo '  echo "[修复脚本] 找到文件: $JNIUS_FILE"' >> /tmp/fix_jnius.sh
-        echo '  cp "$JNIUS_FILE" "${JNIUS_FILE}.backup"' >> /tmp/fix_jnius.sh
-        echo '  echo "[修复脚本] 已备份原文件"' >> /tmp/fix_jnius.sh
-        echo '  sed -i "s/isinstance(\\([^,]*\\),\\s*long)/isinstance(\\1, int)/g" "$JNIUS_FILE"' >> /tmp/fix_jnius.sh
-        echo '  sed -i "s/<long>/<long long>/g" "$JNIUS_FILE"' >> /tmp/fix_jnius.sh
-        echo '  echo "[修复脚本] 修复完成"' >> /tmp/fix_jnius.sh
-        echo 'else' >> /tmp/fix_jnius.sh
-        echo '  echo "[修复脚本] 未找到 jnius_utils.pxi 文件"' >> /tmp/fix_jnius.sh
-        echo 'fi' >> /tmp/fix_jnius.sh
-        chmod +x /tmp/fix_jnius.sh
-
-    - name: Build APK
+    - name: Build APK with enhanced fix
       id: build-step
       run: |
-        echo "=== 开始构建 APK ==="
+        echo "=== 开始构建 APK (增强修复模式) ==="
         echo "首次构建可能需要 10-20 分钟..."
         
         # 清理旧构建
         rm -rf .buildozer/android/platform/build-* 2>/dev/null || true
         
-        # 首次构建（可能会失败）
-        buildozer -v android debug 2>&1 | tee build_output.log
+        echo "阶段 1: 首次构建 (预期会失败)..."
+        # 首次构建，预期会因 long 错误而失败
+        timeout 600 buildozer -v android debug 2>&1 | tee first_build.log || true
         
-        # 运行修复脚本
-        /tmp/fix_jnius.sh
+        echo ""
+        echo "阶段 2: 执行增强修复..."
+        # 创建修复脚本 - 完全不使用heredoc，使用多个echo命令
+        {
+          echo '#!/bin/bash'
+          echo 'echo "执行增强修复..."'
+          echo 'find .buildozer -name "*.pxi" -o -name "*.pyx" | while read file; do'
+          echo '    echo "修复: $file"'
+          echo '    # 修复模式1: isinstance(arg, long)'
+          echo '    sed -i "s/isinstance(\\([^,]*\\),\\s*long)/isinstance(\\1, int)/g" "$file"'
+          echo '    # 修复模式2: (int, long) 元组'
+          echo '    sed -i "s/(int,\\s*long)/(int, int)/g" "$file"'
+          echo '    sed -i "s/(int, long)/(int, int)/g" "$file"'
+          echo '    # 修复模式3: isinstance(arg, (int, long))'
+          echo '    sed -i "s/isinstance([^,]*,\\s*(int,\\s*long))/isinstance(\\1, (int, int))/g" "$file"'
+          echo '    # 修复模式4: <long>'
+          echo '    sed -i "s/<long>/<long long>/g" "$file"'
+          echo 'done'
+          echo 'echo "增强修复完成"'
+        } > /tmp/fix_all_jnius.sh
         
-        # 再次构建
-        buildozer -v android debug 2>&1 | tee -a build_output.log
+        chmod +x /tmp/fix_all_jnius.sh
+        /tmp/fix_all_jnius.sh
+        
+        echo ""
+        echo "阶段 3: 修复后重新构建..."
+        # 清理构建缓存，但保留修复后的源代码
+        rm -rf .buildozer/android/platform/build-*/dists 2>/dev/null || true
+        rm -rf .buildozer/android/platform/build-*/build 2>/dev/null || true
+        
+        # 修复后重新构建
+        timeout 1200 buildozer -v android debug 2>&1 | tee second_build.log
+        
+        BUILD_EXIT=$?
+        echo "构建最终退出代码: $BUILD_EXIT"
         
         # 搜索 APK 文件
         echo "=== 搜索 APK 文件 ==="
@@ -123,11 +136,13 @@ jobs:
             
             # 显示关键错误
             echo "=== 构建日志关键信息 ==="
-            if [ -f "build_output.log" ]; then
+            if [ -f "second_build.log" ]; then
                 echo "最后 50 行日志:"
-                tail -50 build_output.log
+                tail -50 second_build.log
             fi
         fi
+        
+        echo "BUILD_EXIT_CODE=$BUILD_EXIT" >> $GITHUB_OUTPUT
         
         # 如果没有生成 APK，返回失败
         if [ $APK_COUNT -eq 0 ]; then
@@ -148,6 +163,7 @@ jobs:
       with:
         name: build-debug-logs
         path: |
-          build_output.log
+          first_build.log
+          second_build.log
           .buildozer/**/*.log
         retention-days: 5
